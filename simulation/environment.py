@@ -22,6 +22,7 @@ from config import (
 )
 
 from simulation.signal import TrafficSignal
+from agents.intersection_agent import IntersectionAgent
 
 
 # -------------------------
@@ -86,6 +87,13 @@ class TrafficEnvironment:
             remaining_green=10
         )
 
+        # Track when each direction last received green (for fairness/cooldown)
+        self.last_green_time: Dict[str, int] = {d: -999999 for d in ["N", "S", "E", "W"]}
+        self.last_green_time[self.signal.green_direction] = 0
+
+        # Intersection agent (AI decision maker)
+        self.agent = IntersectionAgent()
+
         # Statistics
         self.total_spawned: int = 0
         self.total_passed: int = 0
@@ -115,6 +123,7 @@ class TrafficEnvironment:
 
         for d, lane in self.lanes.items():
             q = lane.queue_length()
+
             if q == 0:
                 avg_wait = 0.0
                 max_wait = 0.0
@@ -123,10 +132,13 @@ class TrafficEnvironment:
                 avg_wait = sum(waits) / q
                 max_wait = max(waits)
 
+            since_green = self.time - self.last_green_time[d]
+
             state[d] = {
                 "queue_length": float(q),
                 "avg_wait_time": float(avg_wait),
                 "max_wait_time": float(max_wait),
+                "since_green": float(since_green),
             }
 
         return state
@@ -155,6 +167,32 @@ class TrafficEnvironment:
             f"{q_info} | spawned={self.total_spawned} passed={self.total_passed}"
         )
 
+    # ---------- Summary metrics ----------
+
+    def print_summary(self) -> None:
+        # Avg and max waiting time of vehicles that successfully passed
+        if self.passed_vehicles:
+            avg_wait = sum(v.wait_time for v in self.passed_vehicles) / len(self.passed_vehicles)
+            max_wait = max(v.wait_time for v in self.passed_vehicles)
+        else:
+            avg_wait = 0.0
+            max_wait = 0
+
+        # Current queue status at the end
+        total_queue = sum(self.lanes[d].queue_length() for d in ["N", "S", "E", "W"])
+
+        # Throughput in vehicles per second
+        throughput = self.total_passed / max(1, SIMULATION_TIME)
+
+        print("\n====== SIMULATION SUMMARY ======")
+        print(f"Total spawned vehicles : {self.total_spawned}")
+        print(f"Total passed vehicles  : {self.total_passed}")
+        print(f"Throughput (veh/sec)   : {throughput:.3f}")
+        print(f"Total vehicles in queue: {total_queue}")
+        print(f"Avg wait (passed)      : {avg_wait:.2f} sec")
+        print(f"Max wait (passed)      : {max_wait} sec")
+        print("================================\n")
+
     # ---------- Main simulation loop ----------
 
     def run(self, verbose: bool = True) -> None:
@@ -164,12 +202,24 @@ class TrafficEnvironment:
             # 1) Spawn vehicles
             self.spawn_vehicles()
 
-            # 2) Move vehicles
+            # 2) Move vehicles based on current green
             self.step_movement()
 
             # 3) Update signal timer
             self.signal.tick()
 
-            # 4) Print status
+            # 4) If green time is over, ask agent to decide next phase
+            if self.signal.is_expired():
+                state = self.get_state()
+                next_dir, duration = self.agent.choose_next_phase(state)
+                self.signal.set_green(next_dir, duration)
+
+                # Update last green time for cooldown/fairness
+                self.last_green_time[next_dir] = self.time
+
+            # 5) Print status
             if verbose:
                 self.print_status()
+
+        # End-of-simulation summary
+        self.print_summary()
