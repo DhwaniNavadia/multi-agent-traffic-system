@@ -35,7 +35,7 @@ class IntersectionAgent:
     SWITCH_MARGIN: float = 3.0
 
     # NEW: Soft emergency threshold to reduce max-wait spikes (seconds)
-    SOFT_MAX_WAIT: float = 12.0
+    SOFT_MAX_WAIT: float = 10.0
 
     def choose_next_phase(self, state: Dict[str, Dict[str, float]]) -> Tuple[str, int]:
         # 1) Fairness override (hard safety)
@@ -45,14 +45,17 @@ class IntersectionAgent:
             mw = self._phase_max_wait(state, forced_phase)
             return forced_phase, self._compute_green_time(q, mw)
 
-        # 2) NEW: Soft emergency switch (reduce max-wait spikes)
+        # 2) Soft emergency switch (reduce max-wait spikes)
         worst_dir = max(["N", "S", "E", "W"], key=lambda d: float(state[d]["max_wait_time"]))
         worst_wait = float(state[worst_dir]["max_wait_time"])
         if worst_wait >= self.SOFT_MAX_WAIT:
             soft_phase = "NS" if worst_dir in ("N", "S") else "EW"
             q = self._phase_queue(state, soft_phase)
             mw = self._phase_max_wait(state, soft_phase)
-            return soft_phase, self._compute_green_time(q, mw)
+
+            # In emergency, keep green shorter so we relieve waiting quickly then re-evaluate
+            duration = min(self._compute_green_time(q, mw), 10)
+            return soft_phase, duration
 
         # 3) Pressure computation
         ns_pressure = self._pressure(state, "NS")
