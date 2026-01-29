@@ -1,12 +1,13 @@
 """
 agents/intersection_agent.py
 
-Rule-based Intersection Agent (NO ML).
+2-phase Intersection Agent (NO ML).
+Chooses between phases:
+- "NS" (N+S green)
+- "EW" (E+W green)
 
-Controls ONE crossroads by deciding:
-- which direction gets green
-- how long green should last
-while ensuring fairness (no starvation) and avoiding immediate repetition (cooldown).
+Uses pressure + hysteresis to avoid oscillations.
+Adds a soft max-wait emergency switch to reduce peak waiting time.
 """
 
 from __future__ import annotations
@@ -26,89 +27,101 @@ from config import (
 
 @dataclass
 class IntersectionAgent:
-    """
-    A simple rational agent:
-    - Prioritizes lanes with higher congestion (queue + waiting)
-    - Forces fairness if any lane waits too long
-    - Applies a cooldown penalty to avoid giving green repeatedly to the same direction
-    """
+    # Pressure weights (tunable)
+    W_QUEUE: float = 1.0
+    W_MAXWAIT: float = 0.25  # big wait should matter, but not dominate
 
-    # Weights for scoring (tunable)
-    alpha_queue: float = 1.0
-    beta_avg_wait: float = 0.5
-    gamma_max_wait: float = 1.5
+    # Hysteresis margin: require other phase to be better by this much to switch
+    SWITCH_MARGIN: float = 3.0
+
+    # NEW: Soft emergency threshold to reduce max-wait spikes (seconds)
+    SOFT_MAX_WAIT: float = 12.0
 
     def choose_next_phase(self, state: Dict[str, Dict[str, float]]) -> Tuple[str, int]:
-        """
-        Input state example:
-        {
-          "N": {"queue_length":..., "avg_wait_time":..., "max_wait_time":..., "since_green":...},
-          ...
-        }
+        # 1) Fairness override (hard safety)
+        forced_phase = self._fairness_phase(state)
+        if forced_phase is not None:
+            q = self._phase_queue(state, forced_phase)
+            mw = self._phase_max_wait(state, forced_phase)
+            return forced_phase, self._compute_green_time(q, mw)
 
-        Returns:
-          (direction, green_duration_seconds)
-        """
+        # 2) NEW: Soft emergency switch (reduce max-wait spikes)
+        worst_dir = max(["N", "S", "E", "W"], key=lambda d: float(state[d]["max_wait_time"]))
+        worst_wait = float(state[worst_dir]["max_wait_time"])
+        if worst_wait >= self.SOFT_MAX_WAIT:
+            soft_phase = "NS" if worst_dir in ("N", "S") else "EW"
+            q = self._phase_queue(state, soft_phase)
+            mw = self._phase_max_wait(state, soft_phase)
+            return soft_phase, self._compute_green_time(q, mw)
 
-        # 1) Fairness override: if any direction's max_wait exceeds threshold -> force it green
-        forced = self._check_fairness_override(state)
-        if forced is not None:
-            duration = self._compute_green_time(queue_len=int(state[forced]["queue_length"]))
-            return forced, duration
+        # 3) Pressure computation
+        ns_pressure = self._pressure(state, "NS")
+        ew_pressure = self._pressure(state, "EW")
 
-        # 2) Otherwise compute a priority score for each direction
-        best_dir = None
-        best_score = float("-inf")
+        # 4) Cooldown on phases
+        phase_info = state.get("_phase", {})
+        ns_since = float(phase_info.get("NS_since_green", 999999.0))
+        ew_since = float(phase_info.get("EW_since_green", 999999.0))
 
-        for d, info in state.items():
-            q = info["queue_length"]
-            avg_w = info["avg_wait_time"]
-            max_w = info["max_wait_time"]
-            since_green = info.get("since_green", 999999.0)
+        if ns_since < DIRECTION_COOLDOWN:
+            ns_pressure -= 1000
+        if ew_since < DIRECTION_COOLDOWN:
+            ew_pressure -= 1000
 
-            score = (self.alpha_queue * q) + (self.beta_avg_wait * avg_w) + (self.gamma_max_wait * max_w)
+        # 5) Decide best pressure phase
+        best = "NS" if ns_pressure >= ew_pressure else "EW"
 
-            # 3) Cooldown penalty:
-            # If this direction got green very recently, avoid selecting it again immediately.
-            if since_green < DIRECTION_COOLDOWN:
-                score -= 1000  # strong penalty to prevent immediate repetition
+        # 6) Hysteresis: if pressures are close, prefer the phase that has been waiting longer
+        if abs(ns_pressure - ew_pressure) < self.SWITCH_MARGIN:
+            ns_since = float(phase_info.get("NS_since_green", 999999.0))
+            ew_since = float(phase_info.get("EW_since_green", 999999.0))
+            best = "NS" if ns_since >= ew_since else "EW"
 
-            if score > best_score:
-                best_score = score
-                best_dir = d
+        q = self._phase_queue(state, best)
+        mw = self._phase_max_wait(state, best)
+        return best, self._compute_green_time(q, mw)
 
-        assert best_dir is not None
+    def _pressure(self, state: Dict[str, Dict[str, float]], phase: str) -> float:
+        q = self._phase_queue(state, phase)
+        mw = self._phase_max_wait(state, phase)
+        return (self.W_QUEUE * q) + (self.W_MAXWAIT * mw)
 
-        # 4) Compute dynamic green time for chosen direction
-        duration = self._compute_green_time(queue_len=int(state[best_dir]["queue_length"]))
-        return best_dir, duration
-
-    def _check_fairness_override(self, state: Dict[str, Dict[str, float]]) -> str | None:
-        """
-        If any lane has waited too long, return that direction to force green.
-        Otherwise return None.
-        """
+    def _fairness_phase(self, state: Dict[str, Dict[str, float]]) -> str | None:
         worst_dir = None
         worst_wait = -1.0
-
-        for d, info in state.items():
-            mw = info["max_wait_time"]
+        for d in ["N", "S", "E", "W"]:
+            mw = float(state[d]["max_wait_time"])
             if mw > worst_wait:
                 worst_wait = mw
                 worst_dir = d
 
         if worst_wait >= MAX_WAIT_THRESHOLD:
-            return worst_dir
-
+            return "NS" if worst_dir in ("N", "S") else "EW"
         return None
 
-    def _compute_green_time(self, queue_len: int) -> int:
+    def _phase_queue(self, state: Dict[str, Dict[str, float]], phase: str) -> int:
+        if phase == "NS":
+            return int(state["N"]["queue_length"] + state["S"]["queue_length"])
+        return int(state["E"]["queue_length"] + state["W"]["queue_length"])
+
+    def _phase_max_wait(self, state: Dict[str, Dict[str, float]], phase: str) -> float:
+        if phase == "NS":
+            return float(max(state["N"]["max_wait_time"], state["S"]["max_wait_time"]))
+        return float(max(state["E"]["max_wait_time"], state["W"]["max_wait_time"]))
+
+    def _compute_green_time(self, queue_len: int, max_wait: float) -> int:
         """
-        Green time formula:
-            green = BASE_GREEN_TIME + queue_len * GREEN_TIME_PER_VEHICLE
-        clipped between MIN_GREEN_TIME and MAX_GREEN_TIME.
+        Slightly conservative greens to reduce max wait:
+        shorter cycles = lower average wait, but not too short to hurt throughput.
         """
         green = BASE_GREEN_TIME + queue_len * GREEN_TIME_PER_VEHICLE
+
+        # small wait boost
+        if max_wait >= 50:
+            green += 4
+        if max_wait >= 100:
+            green += 4
+
         green = max(MIN_GREEN_TIME, green)
         green = min(MAX_GREEN_TIME, green)
         return int(green)
