@@ -39,7 +39,7 @@ PHASE_TO_DIRS = {
 class Vehicle:
     """A simple vehicle model for simulation (no physics)."""
     vid: int
-    direction: str           # 'N', 'S', 'E', 'W'
+    direction: str
     spawn_time: int
     wait_time: int = 0
 
@@ -66,10 +66,6 @@ class Lane:
         return passed
 
 
-# -------------------------
-# Environment (Simulation Engine)
-# -------------------------
-
 class TrafficEnvironment:
     """
     Simulation engine for ONE crossroads using 2-phase control (NS/EW).
@@ -79,7 +75,6 @@ class TrafficEnvironment:
         self.time: int = 0
         self.vehicle_id_counter: int = 1
 
-        # Create one lane per direction
         self.lanes: Dict[str, Lane] = {
             "N": Lane("N"),
             "S": Lane("S"),
@@ -87,20 +82,13 @@ class TrafficEnvironment:
             "W": Lane("W"),
         }
 
-        # Traffic signal (2-phase: NS/EW)
-        self.signal = TrafficSignal(
-            green_phase="NS",
-            remaining_green=10
-        )
+        self.signal = TrafficSignal(green_phase="NS", remaining_green=10)
 
-        # Track when each PHASE last received green (for fairness/cooldown)
         self.last_green_time: Dict[str, int] = {"NS": -999999, "EW": -999999}
         self.last_green_time[self.signal.green_phase] = 0
 
-        # Intersection agent (AI decision maker)
         self.agent = IntersectionAgent()
 
-        # Statistics
         self.total_spawned: int = 0
         self.total_passed: int = 0
         self.passed_vehicles: List[Vehicle] = []
@@ -116,7 +104,7 @@ class TrafficEnvironment:
                 v = Vehicle(
                     vid=self.vehicle_id_counter,
                     direction=d,
-                    spawn_time=self.time
+                    spawn_time=self.time,
                 )
                 self.vehicle_id_counter += 1
                 self.lanes[d].add_vehicle(v)
@@ -125,15 +113,10 @@ class TrafficEnvironment:
     # ---------- State sensing ----------
 
     def get_state(self) -> Dict[str, Dict[str, float]]:
-        """
-        Returns observable state per direction + phase recency info.
-        Agent will use this to choose between phases NS/EW.
-        """
         state: Dict[str, Dict[str, float]] = {}
 
         for d, lane in self.lanes.items():
             q = lane.queue_length()
-
             if q == 0:
                 avg_wait = 0.0
                 max_wait = 0.0
@@ -148,7 +131,6 @@ class TrafficEnvironment:
                 "max_wait_time": float(max_wait),
             }
 
-        # Add phase cooldown information
         state["_phase"] = {
             "NS_since_green": float(self.time - self.last_green_time["NS"]),
             "EW_since_green": float(self.time - self.last_green_time["EW"]),
@@ -156,26 +138,20 @@ class TrafficEnvironment:
 
         return state
 
-    # ---------- Gap-out helpers ----------
+    # ---------- Helpers ----------
 
     def _phase_queue_sum(self, phase: str) -> int:
-        dirs = PHASE_TO_DIRS[phase]
-        return sum(self.lanes[d].queue_length() for d in dirs)
+        return sum(self.lanes[d].queue_length() for d in PHASE_TO_DIRS[phase])
 
     def _should_gap_out(self) -> bool:
-        """
-        Gap-out rule:
-        If current green phase has no queued vehicles, end green early.
-        """
         return self._phase_queue_sum(self.signal.green_phase) == 0
+
+    def _global_max_wait(self) -> float:
+        return float(max(self.get_state()[d]["max_wait_time"] for d in ["N", "S", "E", "W"]))
 
     # ---------- Vehicle movement ----------
 
     def step_movement(self) -> None:
-        """
-        Vehicles in GREEN PHASE move from BOTH lanes in that phase.
-        Red lanes accumulate wait.
-        """
         green_dirs = set(PHASE_TO_DIRS[self.signal.green_phase])
 
         for d, lane in self.lanes.items():
@@ -189,10 +165,7 @@ class TrafficEnvironment:
     # ---------- Debug output ----------
 
     def print_status(self) -> None:
-        q_info = " ".join(
-            f"{d}={self.lanes[d].queue_length():2d}"
-            for d in ["N", "S", "E", "W"]
-        )
+        q_info = " ".join(f"{d}={self.lanes[d].queue_length():2d}" for d in ["N", "S", "E", "W"])
         print(
             f"t={self.time:3d} | "
             f"Phase={self.signal.green_phase}({self.signal.remaining_green:2d}s) | "
@@ -224,11 +197,6 @@ class TrafficEnvironment:
     # ---------- Main simulation loop ----------
 
     def run(self, verbose: bool = True, mode: str = "agent", fixed_cycle: int = 10) -> None:
-        """
-        mode:
-          - "agent": agent chooses next PHASE (NS/EW)
-          - "fixed": alternates phases every fixed_cycle seconds (baseline)
-        """
         phases = ["NS", "EW"]
         fixed_index = 0
 
@@ -238,33 +206,37 @@ class TrafficEnvironment:
             # 1) Spawn vehicles
             self.spawn_vehicles()
 
-            # 2) PRE-EMPTIVE SWITCH (NEW ORDER):
-            # If expired OR gap-out, switch BEFORE moving vehicles, so the switch takes effect immediately.
-            if self.signal.is_expired() or self._should_gap_out():
+            # 2) Move vehicles (use current phase for this second)
+            self.step_movement()
+
+            # 3) Tick timer
+            self.signal.tick()
+
+            # 4) Gap-out AFTER movement: if phase now empty, end green
+            if self._should_gap_out():
+                self.signal.remaining_green = 0
+
+            # 5) Safety cut: if max waiting is rising too much, end phase early
+            # (this forces re-decision next step without breaking throughput)
+            if self._global_max_wait() >= 12.0:
+                self.signal.remaining_green = 0
+
+            # 6) Switch only when expired
+            if self.signal.is_expired():
                 if mode == "agent":
                     state = self.get_state()
                     next_phase, duration = self.agent.choose_next_phase(state)
                     self.signal.set_green(next_phase, duration)
                     self.last_green_time[next_phase] = self.time
-
                 elif mode == "fixed":
                     fixed_index = (fixed_index + 1) % len(phases)
                     next_phase = phases[fixed_index]
                     self.signal.set_green(next_phase, fixed_cycle)
                     self.last_green_time[next_phase] = self.time
-
                 else:
                     raise ValueError("mode must be 'agent' or 'fixed'")
 
-            # 3) Move vehicles using the (possibly updated) phase
-            self.step_movement()
-
-            # 4) Update signal timer AFTER movement
-            self.signal.tick()
-
-            # 5) Print status
             if verbose:
                 self.print_status()
 
-        # End-of-simulation summary
         self.print_summary()
